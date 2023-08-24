@@ -89,6 +89,7 @@ class BaseSchedulerNode:
         self.max_order: Optional[int] = None
         self.last_usage: Set[str] = None  # buffers that won't be used after this kernel
         self.written = False
+        self.node_idx = None
 
     def __repr__(self):
         return f"{type(self).__name__}(name={self.get_name()!r})"
@@ -173,6 +174,7 @@ class BaseSchedulerNode:
 
     def used_or_aliased_buffer_names(self) -> Set[str]:
         used_names = set()
+
         for dep in itertools.chain(self.read_writes.reads, self.read_writes.writes):
             used_names.add(dep.name)
             if V.graph.name_to_buffer.get(dep.name):
@@ -233,6 +235,9 @@ class BaseSchedulerNode:
 
     def get_nodes(self) -> List["BaseSchedulerNode"]:
         return [self]
+
+    def get_node_indices(self) -> List[int]:
+        return [node.node_idx for node in self.get_nodes()]
 
     def get_device(self):
         return self.node.get_device()
@@ -951,6 +956,8 @@ class Scheduler:
         }
 
         self.nodes = [self.create_scheduler_node(n) for n in nodes]
+        for idx, node in enumerate(self.nodes):
+            node.node_idx = idx
 
         # some new constants could have been created above
         self.available_buffer_names.update(V.graph.constants.keys())
@@ -988,7 +995,6 @@ class Scheduler:
         # used during codegen:
         self.current_device = None
         self.buffer_names_to_free = set()
-        self.buffer_names_no_longer_needed = set()
 
         # fx graph node to the position it appears in the graph
         # for debug attribution
@@ -1047,25 +1053,6 @@ class Scheduler:
         mutation properly.
         """
         name_to_users = collections.defaultdict(list)
-
-        # handle aliasing by using python aliasing in name_to_users
-        # if foo aliases bar then we will make name_to_users["foo"] point
-        # to the same python list as name_to_users["bar"]
-        for node1 in self.nodes:
-            node1_name = node1.get_name()
-            for node2_name in node1.get_aliases():
-                if node1_name in name_to_users and node2_name in name_to_users:
-                    # merge the two
-                    list1 = name_to_users[node1_name]
-                    list2 = name_to_users[node2_name]
-                    combined = list1 + list2
-                    for key in name_to_users.keys():
-                        if name_to_users[key] is list1 or name_to_users[key] is list2:
-                            name_to_users[key] = combined
-                elif node1_name in name_to_users:
-                    name_to_users[node2_name] = name_to_users[node1_name]
-                else:
-                    name_to_users[node1_name] = name_to_users[node2_name]
 
         def rename(n):
             if n in self.mutation_renames:
@@ -1522,9 +1509,16 @@ class Scheduler:
         same kernel can be removed.
         """
 
-        names_to_remove = (
-            V.kernel.store_buffer_names & self.buffer_names_no_longer_needed
-        )
+        fused_node_names = {
+            node.get_name()
+            for node in V.kernel.node_schedule
+            if isinstance(node, BaseSchedulerNode)
+        }
+        names_to_remove = []
+        for out_buf in V.kernel.store_buffer_names:
+            users = {user.get_name() for user in self.name_to_node[out_buf].users}
+            if users.issubset(fused_node_names):
+                names_to_remove.append(out_buf)
 
         def remove_filter(n):
             return (
@@ -1620,7 +1614,6 @@ class Scheduler:
     def codegen(self):
         for node in self.nodes:
             self.enter_context(node)
-            self.buffer_names_no_longer_needed.update(node.last_usage)
 
             if not isinstance(node, NopKernelSchedulerNode):
                 device = node.get_device()
